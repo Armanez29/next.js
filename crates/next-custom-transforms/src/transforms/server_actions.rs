@@ -34,11 +34,19 @@ pub struct Config {
     pub cache_kinds: FxHashSet<RcStr>,
 }
 
+#[derive(Clone, Debug)]
+enum Directive {
+    UseServer,
+    UseCache { cache_kind: RcStr },
+}
+
+#[derive(Clone, Debug)]
 enum DirectiveLocation {
     Module,
     FunctionBody,
 }
 
+#[derive(Clone, Debug)]
 enum ServerActionsErrorKind {
     ExportedSyncFunction {
         span: Span,
@@ -46,7 +54,7 @@ enum ServerActionsErrorKind {
     },
     InlineSyncFunction {
         span: Span,
-        is_action_fn: bool,
+        directive: Directive,
     },
     InlineUseCacheInClientComponent {
         span: Span,
@@ -68,6 +76,10 @@ enum ServerActionsErrorKind {
         directive: String,
         expected_directive: String,
     },
+    MultipleDirectives {
+        span: Span,
+        location: DirectiveLocation,
+    },
     UnknownCacheKind {
         span: Span,
         cache_kind: RcStr,
@@ -86,12 +98,6 @@ enum ServerActionsErrorKind {
 // Using BTreeMap to ensure the order of the actions is deterministic.
 pub type ActionsMap = BTreeMap<String, String>;
 
-// Directive-level information about a function body
-struct BodyInfo {
-    is_action_fn: bool,
-    cache_kind: Option<RcStr>,
-}
-
 #[tracing::instrument(level = tracing::Level::TRACE, skip_all)]
 pub fn server_actions<C: Comments>(file_name: &FileName, config: Config, comments: C) -> impl Pass {
     visit_mut_pass(ServerActions {
@@ -99,8 +105,7 @@ pub fn server_actions<C: Comments>(file_name: &FileName, config: Config, comment
         comments,
         file_name: file_name.to_string(),
         start_pos: BytePos(0),
-        in_action_file: false,
-        file_cache_kind: None,
+        file_directive: None,
         in_exported_expr: false,
         in_default_export_decl: false,
         fn_decl_ident: None,
@@ -150,8 +155,7 @@ struct ServerActions<C: Comments> {
     comments: C,
 
     start_pos: BytePos,
-    in_action_file: bool,
-    file_cache_kind: Option<RcStr>,
+    file_directive: Option<Directive>,
     in_exported_expr: bool,
     in_default_export_decl: bool,
     fn_decl_ident: Option<Ident>,
@@ -310,55 +314,119 @@ impl<C: Comments> ServerActions<C> {
         })
     }
 
-    // Check if the function or arrow function is an action or cache function
-    fn get_body_info(&mut self, maybe_body: Option<&mut BlockStmt>) -> BodyInfo {
-        let mut is_action_fn = false;
-        let mut cache_kind = None;
+    // Check if the function or arrow function is an action or cache function,
+    // and remove any server function directive.
+    fn get_directive_for_function(
+        &mut self,
+        maybe_body: Option<&mut BlockStmt>,
+    ) -> Option<Directive> {
+        let mut directive: Option<Directive> = None;
 
         // Even if it's a file-level action or cache module, the function body
         // might still have directives that override the module-level annotations.
 
-        // Check if the function has a directive.
+        // Check if the function has a server function directive.
         if let Some(body) = maybe_body {
-            let mut span = None;
-            remove_server_directive_index_in_fn(
-                &mut body.stmts,
-                &mut is_action_fn,
-                &mut cache_kind,
-                &mut span,
-                &self.config,
-            );
+            let mut allow_directive = true;
 
-            if !self.config.is_react_server_layer {
-                if is_action_fn && !self.in_action_file {
-                    emit_error(ServerActionsErrorKind::InlineUseServerInClientComponent {
-                        span: span.unwrap_or(body.span),
-                    })
+            body.stmts.retain(|stmt| {
+                if let Stmt::Expr(ExprStmt {
+                    expr: box Expr::Lit(Lit::Str(Str { value, span, .. })),
+                    ..
+                }) = stmt
+                {
+                    if value == "use server" {
+                        if !self.config.is_react_server_layer && self.file_directive.is_none() {
+                            emit_error(ServerActionsErrorKind::InlineUseServerInClientComponent {
+                                span: *span,
+                            })
+                        } else if let Some(Directive::UseCache { .. }) = directive {
+                            emit_error(ServerActionsErrorKind::MultipleDirectives {
+                                span: *span,
+                                location: DirectiveLocation::FunctionBody,
+                            });
+                        } else if allow_directive {
+                            directive = Some(Directive::UseServer);
+                            return false;
+                        } else {
+                            emit_error(ServerActionsErrorKind::MisplacedDirective {
+                                span: *span,
+                                directive: value.to_string(),
+                                location: DirectiveLocation::FunctionBody,
+                            });
+                        }
+                    } else if detect_similar_strings(value, "use server") {
+                        // Detect typo of "use server"
+                        emit_error(ServerActionsErrorKind::MisspelledDirective {
+                            span: *span,
+                            directive: value.to_string(),
+                            expected_directive: "use server".to_string(),
+                        });
+                    } else if value == "use cache" || value.starts_with("use cache: ") {
+                        if !self.config.is_react_server_layer && self.file_directive.is_none() {
+                            emit_error(ServerActionsErrorKind::InlineUseCacheInClientComponent {
+                                span: *span,
+                            })
+                        } else if let Some(Directive::UseServer) = directive {
+                            emit_error(ServerActionsErrorKind::MultipleDirectives {
+                                span: *span,
+                                location: DirectiveLocation::FunctionBody,
+                            });
+                        } else if allow_directive {
+                            if !self.config.dynamic_io_enabled {
+                                emit_error(ServerActionsErrorKind::UseCacheWithoutDynamicIO {
+                                    span: *span,
+                                    directive: value.to_string(),
+                                });
+                            }
+
+                            if value == "use cache" {
+                                directive = Some(Directive::UseCache {
+                                    cache_kind: RcStr::from("default"),
+                                })
+                            } else {
+                                // Slice the value after "use cache: "
+                                let cache_kind = RcStr::from(value.split_at("use cache: ".len()).1);
+
+                                if !self.config.cache_kinds.contains(&cache_kind) {
+                                    emit_error(ServerActionsErrorKind::UnknownCacheKind {
+                                        span: *span,
+                                        cache_kind: cache_kind.clone(),
+                                    });
+                                }
+
+                                directive = Some(Directive::UseCache { cache_kind })
+                            };
+                            return false;
+                        } else {
+                            emit_error(ServerActionsErrorKind::MisplacedDirective {
+                                span: *span,
+                                directive: value.to_string(),
+                                location: DirectiveLocation::FunctionBody,
+                            });
+                        }
+                    } else if detect_similar_strings(value, "use cache") {
+                        // Detect typo of "use cache"
+                        emit_error(ServerActionsErrorKind::MisspelledDirective {
+                            span: *span,
+                            directive: value.to_string(),
+                            expected_directive: "use cache".to_string(),
+                        });
+                    }
+                } else {
+                    // Server directives are not allowed to be placed after other statements.
+                    allow_directive = false;
                 }
-
-                if cache_kind.is_some() && self.file_cache_kind.is_none() && !self.in_action_file {
-                    emit_error(ServerActionsErrorKind::InlineUseCacheInClientComponent {
-                        span: span.unwrap_or(body.span),
-                    });
-                }
-            }
+                true
+            });
         }
 
-        // Self-annotations take precedence over module-level annotations.
-        if self.in_exported_expr && !is_action_fn && cache_kind.is_none() {
-            if self.in_action_file {
-                // All export functions in a server file are actions
-                is_action_fn = true;
-            } else if let Some(cache_file_type) = &self.file_cache_kind {
-                // All export functions in a cache file are cache functions
-                cache_kind = Some(cache_file_type.clone());
-            }
+        // All exported functions inherit the file directive if they don't have their own directive.
+        if self.in_exported_expr && directive.is_none() && self.file_directive.is_some() {
+            directive = self.file_directive.clone();
         }
 
-        BodyInfo {
-            is_action_fn,
-            cache_kind,
-        }
+        directive
     }
 
     fn maybe_hoist_and_create_proxy_for_server_action_arrow_expr(
@@ -619,7 +687,7 @@ impl<C: Comments> ServerActions<C> {
     fn maybe_hoist_and_create_proxy_for_cache_arrow_expr(
         &mut self,
         ids_from_closure: Vec<Name>,
-        cache_kind: &str,
+        cache_kind: RcStr,
         arrow: &mut ArrowExpr,
     ) -> Box<Expr> {
         let mut new_params: Vec<Param> = vec![];
@@ -646,7 +714,6 @@ impl<C: Comments> ServerActions<C> {
         let reference_id = self.generate_server_reference_id(&export_name, true, Some(&new_params));
 
         self.has_cache = true;
-        self.has_action = true;
         self.export_actions
             .push((export_name.to_string(), reference_id.clone()));
 
@@ -691,7 +758,7 @@ impl<C: Comments> ServerActions<C> {
                                     ..Default::default()
                                 }),
                             })),
-                            cache_kind,
+                            &cache_kind,
                             &reference_id,
                             ids_from_closure.len(),
                         )),
@@ -754,7 +821,7 @@ impl<C: Comments> ServerActions<C> {
         &mut self,
         ids_from_closure: Vec<Name>,
         fn_name: Option<Ident>,
-        cache_kind: &str,
+        cache_kind: RcStr,
         function: &mut Function,
     ) -> Box<Expr> {
         let mut new_params: Vec<Param> = vec![];
@@ -780,7 +847,6 @@ impl<C: Comments> ServerActions<C> {
         let reference_id = self.generate_server_reference_id(&cache_name, true, Some(&new_params));
 
         self.has_cache = true;
-        self.has_action = true;
         self.export_actions
             .push((cache_name.to_string(), reference_id.clone()));
 
@@ -813,7 +879,7 @@ impl<C: Comments> ServerActions<C> {
                                     ..function.take()
                                 }),
                             })),
-                            cache_kind,
+                            &cache_kind,
                             &reference_id,
                             ids_from_closure.len(),
                         )),
@@ -908,11 +974,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
     }
 
     fn visit_mut_function(&mut self, f: &mut Function) {
-        let BodyInfo {
-            is_action_fn,
-            cache_kind,
-        } = self.get_body_info(f.body.as_mut());
-
+        let directive = self.get_directive_for_function(f.body.as_mut());
         let declared_idents_until = self.declared_idents.len();
         let current_names = take(&mut self.names);
 
@@ -924,8 +986,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
             let old_in_default_export_decl = self.in_default_export_decl;
             let old_fn_decl_ident = self.fn_decl_ident.clone();
             self.in_module_level = false;
-            self.should_track_names =
-                is_action_fn || cache_kind.is_some() || self.should_track_names;
+            self.should_track_names = directive.is_some() || self.should_track_names;
             self.in_exported_expr = false;
             self.in_default_export_decl = false;
             self.fn_decl_ident = None;
@@ -937,6 +998,10 @@ impl<C: Comments> VisitMut for ServerActions<C> {
             self.fn_decl_ident = old_fn_decl_ident;
         }
 
+        if !self.config.is_react_server_layer {
+            return;
+        }
+
         let mut child_names = if self.should_track_names {
             let names = take(&mut self.names);
             self.names = current_names;
@@ -946,98 +1011,96 @@ impl<C: Comments> VisitMut for ServerActions<C> {
             take(&mut self.names)
         };
 
-        if (is_action_fn || cache_kind.is_some()) && !f.is_async {
-            emit_error(ServerActionsErrorKind::InlineSyncFunction {
-                span: f.span,
-                is_action_fn,
-            });
-
-            return;
-        }
-
-        if !is_action_fn && cache_kind.is_none() || !self.config.is_react_server_layer {
-            return;
-        }
-
-        if let Some(cache_kind_str) = cache_kind {
-            // Collect all the identifiers defined inside the closure and used
-            // in the cache function. With deduplication.
-            retain_names_from_declared_idents(
-                &mut child_names,
-                &self.declared_idents[..declared_idents_until],
-            );
-
-            let new_expr = self.maybe_hoist_and_create_proxy_for_cache_function(
-                child_names.clone(),
-                self.fn_decl_ident
-                    .clone()
-                    .or(self.arrow_or_fn_expr_ident.clone()),
-                cache_kind_str.as_str(),
-                f,
-            );
-
-            if self.in_default_export_decl {
-                // This function expression is also the default export:
-                // `export default async function() {}`
-                // This specific case (default export) isn't handled by `visit_mut_expr`.
-                // Replace the original function expr with a action proxy expr.
-                self.rewrite_default_fn_expr_to_proxy_expr = Some(new_expr);
-            } else if let Some(ident) = &self.fn_decl_ident {
-                // Replace the original function declaration with a cache decl.
-                self.rewrite_fn_decl_to_proxy_decl = Some(VarDecl {
-                    span: DUMMY_SP,
-                    kind: VarDeclKind::Var,
-                    decls: vec![VarDeclarator {
-                        span: DUMMY_SP,
-                        name: Pat::Ident(ident.clone().into()),
-                        init: Some(new_expr),
-                        definite: false,
-                    }],
-                    ..Default::default()
+        if let Some(directive) = directive {
+            if !f.is_async {
+                emit_error(ServerActionsErrorKind::InlineSyncFunction {
+                    span: f.span,
+                    directive,
                 });
-            } else {
-                self.rewrite_expr_to_proxy_expr = Some(new_expr);
+
+                return;
             }
-        }
 
-        if is_action_fn && !(self.in_action_file && self.in_exported_expr) {
-            // Collect all the identifiers defined inside the closure and used
-            // in the action function. With deduplication.
-            retain_names_from_declared_idents(
-                &mut child_names,
-                &self.declared_idents[..declared_idents_until],
-            );
+            if let Directive::UseCache { cache_kind } = directive {
+                // Collect all the identifiers defined inside the closure and used
+                // in the cache function. With deduplication.
+                retain_names_from_declared_idents(
+                    &mut child_names,
+                    &self.declared_idents[..declared_idents_until],
+                );
 
-            let new_expr = self.maybe_hoist_and_create_proxy_for_server_action_function(
-                child_names,
-                f,
-                self.fn_decl_ident
-                    .clone()
-                    .or(self.arrow_or_fn_expr_ident.clone()),
-            );
+                let new_expr = self.maybe_hoist_and_create_proxy_for_cache_function(
+                    child_names.clone(),
+                    self.fn_decl_ident
+                        .clone()
+                        .or(self.arrow_or_fn_expr_ident.clone()),
+                    cache_kind,
+                    f,
+                );
 
-            if self.in_default_export_decl {
-                // This function expression is also the default export:
-                // `export default async function() {}`
-                // This specific case (default export) isn't handled by `visit_mut_expr`.
-                // Replace the original function expr with a action proxy expr.
-                self.rewrite_default_fn_expr_to_proxy_expr = Some(new_expr);
-            } else if let Some(ident) = &self.fn_decl_ident {
-                // Replace the original function declaration with an action proxy declaration
-                // expr.
-                self.rewrite_fn_decl_to_proxy_decl = Some(VarDecl {
-                    span: DUMMY_SP,
-                    kind: VarDeclKind::Var,
-                    decls: vec![VarDeclarator {
+                if self.in_default_export_decl {
+                    // This function expression is also the default export:
+                    // `export default async function() {}`
+                    // This specific case (default export) isn't handled by `visit_mut_expr`.
+                    // Replace the original function expr with a action proxy expr.
+                    self.rewrite_default_fn_expr_to_proxy_expr = Some(new_expr);
+                } else if let Some(ident) = &self.fn_decl_ident {
+                    // Replace the original function declaration with a cache decl.
+                    self.rewrite_fn_decl_to_proxy_decl = Some(VarDecl {
                         span: DUMMY_SP,
-                        name: Pat::Ident(ident.clone().into()),
-                        init: Some(new_expr),
-                        definite: false,
-                    }],
-                    ..Default::default()
-                });
-            } else {
-                self.rewrite_expr_to_proxy_expr = Some(new_expr);
+                        kind: VarDeclKind::Var,
+                        decls: vec![VarDeclarator {
+                            span: DUMMY_SP,
+                            name: Pat::Ident(ident.clone().into()),
+                            init: Some(new_expr),
+                            definite: false,
+                        }],
+                        ..Default::default()
+                    });
+                } else {
+                    self.rewrite_expr_to_proxy_expr = Some(new_expr);
+                }
+            } else if !(matches!(self.file_directive, Some(Directive::UseServer))
+                && self.in_exported_expr)
+            {
+                // Collect all the identifiers defined inside the closure and used
+                // in the action function. With deduplication.
+                retain_names_from_declared_idents(
+                    &mut child_names,
+                    &self.declared_idents[..declared_idents_until],
+                );
+
+                let new_expr = self.maybe_hoist_and_create_proxy_for_server_action_function(
+                    child_names,
+                    f,
+                    self.fn_decl_ident
+                        .clone()
+                        .or(self.arrow_or_fn_expr_ident.clone()),
+                );
+
+                if self.in_default_export_decl {
+                    // This function expression is also the default export:
+                    // `export default async function() {}`
+                    // This specific case (default export) isn't handled by `visit_mut_expr`.
+                    // Replace the original function expr with a action proxy expr.
+                    self.rewrite_default_fn_expr_to_proxy_expr = Some(new_expr);
+                } else if let Some(ident) = &self.fn_decl_ident {
+                    // Replace the original function declaration with an action proxy declaration
+                    // expr.
+                    self.rewrite_fn_decl_to_proxy_decl = Some(VarDecl {
+                        span: DUMMY_SP,
+                        kind: VarDeclKind::Var,
+                        decls: vec![VarDeclarator {
+                            span: DUMMY_SP,
+                            name: Pat::Ident(ident.clone().into()),
+                            init: Some(new_expr),
+                            definite: false,
+                        }],
+                        ..Default::default()
+                    });
+                } else {
+                    self.rewrite_expr_to_proxy_expr = Some(new_expr);
+                }
             }
         }
     }
@@ -1067,14 +1130,13 @@ impl<C: Comments> VisitMut for ServerActions<C> {
     fn visit_mut_arrow_expr(&mut self, a: &mut ArrowExpr) {
         // Arrow expressions need to be visited in prepass to determine if it's
         // an action function or not.
-        let BodyInfo {
-            is_action_fn,
-            cache_kind,
-        } = self.get_body_info(if let BlockStmtOrExpr::BlockStmt(block) = &mut *a.body {
-            Some(block)
-        } else {
-            None
-        });
+        let directive = self.get_directive_for_function(
+            if let BlockStmtOrExpr::BlockStmt(block) = &mut *a.body {
+                Some(block)
+            } else {
+                None
+            },
+        );
 
         let declared_idents_until = self.declared_idents.len();
         let current_names = take(&mut self.names);
@@ -1086,8 +1148,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
             let old_in_exported_expr = self.in_exported_expr;
             let old_in_default_export_decl = self.in_default_export_decl;
             self.in_module_level = false;
-            self.should_track_names =
-                is_action_fn || cache_kind.is_some() || self.should_track_names;
+            self.should_track_names = directive.is_some() || self.should_track_names;
             self.in_exported_expr = false;
             self.in_default_export_decl = false;
             {
@@ -1102,6 +1163,10 @@ impl<C: Comments> VisitMut for ServerActions<C> {
             self.in_default_export_decl = old_in_default_export_decl;
         }
 
+        if !self.config.is_react_server_layer {
+            return;
+        }
+
         let mut child_names = if self.should_track_names {
             let names = take(&mut self.names);
             self.names = current_names;
@@ -1111,39 +1176,36 @@ impl<C: Comments> VisitMut for ServerActions<C> {
             take(&mut self.names)
         };
 
-        if !a.is_async && (is_action_fn || cache_kind.is_some()) {
-            emit_error(ServerActionsErrorKind::InlineSyncFunction {
-                span: a.span,
-                is_action_fn,
-            });
+        if let Some(directive) = directive {
+            if !a.is_async {
+                emit_error(ServerActionsErrorKind::InlineSyncFunction {
+                    span: a.span,
+                    directive,
+                });
 
-            return;
+                return;
+            }
+
+            // Collect all the identifiers defined inside the closure and used
+            // in the action function. With deduplication.
+            retain_names_from_declared_idents(
+                &mut child_names,
+                &self.declared_idents[..declared_idents_until],
+            );
+
+            if let Directive::UseCache { cache_kind } = directive {
+                self.rewrite_expr_to_proxy_expr =
+                    Some(self.maybe_hoist_and_create_proxy_for_cache_arrow_expr(
+                        child_names,
+                        cache_kind,
+                        a,
+                    ));
+            } else if !matches!(self.file_directive, Some(Directive::UseServer)) {
+                self.rewrite_expr_to_proxy_expr = Some(
+                    self.maybe_hoist_and_create_proxy_for_server_action_arrow_expr(child_names, a),
+                );
+            }
         }
-
-        if !is_action_fn && cache_kind.is_none() || !self.config.is_react_server_layer {
-            return;
-        }
-
-        // Collect all the identifiers defined inside the closure and used
-        // in the action function. With deduplication.
-        retain_names_from_declared_idents(
-            &mut child_names,
-            &self.declared_idents[..declared_idents_until],
-        );
-
-        let maybe_new_expr = if is_action_fn && !self.in_action_file {
-            Some(self.maybe_hoist_and_create_proxy_for_server_action_arrow_expr(child_names, a))
-        } else {
-            cache_kind.map(|cache_kind_str| {
-                self.maybe_hoist_and_create_proxy_for_cache_arrow_expr(
-                    child_names,
-                    cache_kind_str.as_str(),
-                    a,
-                )
-            })
-        };
-
-        self.rewrite_expr_to_proxy_expr = maybe_new_expr;
     }
 
     fn visit_mut_module(&mut self, m: &mut Module) {
@@ -1252,26 +1314,25 @@ impl<C: Comments> VisitMut for ServerActions<C> {
     }
 
     fn visit_mut_module_items(&mut self, stmts: &mut Vec<ModuleItem>) {
-        remove_server_directive_index_in_module(
-            stmts,
-            &mut self.in_action_file,
-            &mut self.file_cache_kind,
-            &mut self.has_action,
-            &mut self.has_cache,
-            &self.config,
-        );
+        self.file_directive = get_directive_for_module(stmts, &self.config);
 
-        // If we're in a "use cache" file, collect all original IDs from export
-        // specifiers in a pre-pass so that we know which functions are
-        // exported, e.g. for this case:
-        // ```
-        // "use cache"
-        // function foo() {}
-        // function Bar() {}
-        // export { foo }
-        // export default Bar
-        // ```
-        if self.file_cache_kind.is_some() {
+        let in_cache_file = matches!(self.file_directive, Some(Directive::UseCache { .. }));
+        let in_action_file = matches!(self.file_directive, Some(Directive::UseServer));
+
+        self.has_action = in_action_file;
+        self.has_cache = in_cache_file;
+
+        if in_cache_file {
+            // If we're in a "use cache" file, collect all original IDs from
+            // export specifiers in a pre-pass so that we know which functions
+            // are exported, e.g. for this case:
+            // ```
+            // "use cache"
+            // function foo() {}
+            // function Bar() {}
+            // export { foo }
+            // export default Bar
+            // ```
             for stmt in stmts.iter() {
                 match stmt {
                     ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export_default_expr)) => {
@@ -1298,8 +1359,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
         }
 
         // Only track exported identifiers in action files or cache files.
-        let is_cache_file = self.file_cache_kind.is_some();
-        let should_track_exports = self.in_action_file || is_cache_file;
+        let should_track_exports = self.file_directive.is_some();
 
         let old_annotations = self.annotations.take();
         let mut new = Vec::with_capacity(stmts.len());
@@ -1325,7 +1385,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
                                 } else if is_cache_fn {
                                     true
                                 } else {
-                                    is_cache_file
+                                    in_cache_file
                                 };
 
                                 // If it's a self-annotated cache function, we need to skip
@@ -1356,7 +1416,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
                                         ident.sym.to_string(),
                                         self.generate_server_reference_id(
                                             ident.sym.as_ref(),
-                                            is_cache_file,
+                                            in_cache_file,
                                             None,
                                         ),
                                     ));
@@ -1397,7 +1457,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
                                                 sym.to_string(),
                                                 self.generate_server_reference_id(
                                                     sym.as_ref(),
-                                                    is_cache_file,
+                                                    in_cache_file,
                                                     None,
                                                 ),
                                             ));
@@ -1408,7 +1468,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
                                                 str.value.to_string(),
                                                 self.generate_server_reference_id(
                                                     str.value.as_ref(),
-                                                    is_cache_file,
+                                                    in_cache_file,
                                                     None,
                                                 ),
                                             ));
@@ -1420,7 +1480,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
                                             ident.sym.to_string(),
                                             self.generate_server_reference_id(
                                                 ident.sym.as_ref(),
-                                                is_cache_file,
+                                                in_cache_file,
                                                 None,
                                             ),
                                         ));
@@ -1444,7 +1504,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
                             } else if is_cache_fn {
                                 true
                             } else {
-                                is_cache_file
+                                in_cache_file
                             };
 
                             // If it's a self-annotated cache function, we need to skip
@@ -1519,7 +1579,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
                                 } else if is_cache_fn {
                                     true
                                 } else {
-                                    is_cache_file
+                                    in_cache_file
                                 };
 
                                 // If it's a self-annotated cache function, we need to skip
@@ -1568,7 +1628,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
                                     "default".into(),
                                     self.generate_server_reference_id(
                                         "default",
-                                        is_cache_file,
+                                        in_cache_file,
                                         None,
                                     ),
                                 ));
@@ -1586,7 +1646,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
                                     "default".into(),
                                     self.generate_server_reference_id(
                                         "default",
-                                        is_cache_file,
+                                        in_cache_file,
                                         None,
                                     ),
                                 ));
@@ -1611,7 +1671,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
                 if disallowed_export_span != DUMMY_SP {
                     emit_error(ServerActionsErrorKind::ExportedSyncFunction {
                         span: disallowed_export_span,
-                        in_action_file: self.in_action_file,
+                        in_action_file,
                     });
 
                     return;
@@ -1632,9 +1692,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
                 self.rewrite_default_fn_expr_to_proxy_expr = None;
             }
 
-            if self.config.is_react_server_layer
-                || (!self.in_action_file && self.file_cache_kind.is_none())
-            {
+            if self.config.is_react_server_layer || self.file_directive.is_none() {
                 new.append(&mut self.hoisted_extra_items);
                 new.push(new_stmt);
                 new.extend(self.annotations.drain(..).map(ModuleItem::Stmt));
@@ -1753,7 +1811,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
                             }));
                         new.push(export_expr);
                     }
-                } else if self.file_cache_kind.is_none() {
+                } else if !in_cache_file {
                     self.annotations.push(Stmt::Expr(ExprStmt {
                         span: DUMMY_SP,
                         expr: Box::new(annotate_ident_as_server_reference(
@@ -1776,7 +1834,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
                 new.append(&mut self.extra_items);
 
                 // For "use cache" files, there's no need to do extra annotations.
-                if self.file_cache_kind.is_none() && !self.exported_idents.is_empty() {
+                if !in_cache_file && !self.exported_idents.is_empty() {
                     let ensure_ident = private_ident!("ensureServerEntryExports");
                     new.push(ModuleItem::ModuleDecl(ModuleDecl::Import(ImportDecl {
                         span: DUMMY_SP,
@@ -1830,9 +1888,7 @@ impl<C: Comments> VisitMut for ServerActions<C> {
             let mut actions = self.export_actions.clone();
 
             // All exported values are considered as actions if the file is an action file.
-            if self.in_action_file
-                || self.file_cache_kind.is_some() && !self.config.is_react_server_layer
-            {
+            if in_action_file || in_cache_file && !self.config.is_react_server_layer {
                 actions.extend(
                     self.exported_idents
                         .iter()
@@ -2292,15 +2348,9 @@ fn detect_similar_strings(a: &str, b: &str) -> bool {
     }
 }
 
-fn remove_server_directive_index_in_module(
-    stmts: &mut Vec<ModuleItem>,
-    in_action_file: &mut bool,
-    file_cache_kind: &mut Option<RcStr>,
-    has_action: &mut bool,
-    has_cache: &mut bool,
-    config: &Config,
-) {
-    let mut is_directive = true;
+fn get_directive_for_module(stmts: &mut Vec<ModuleItem>, config: &Config) -> Option<Directive> {
+    let mut directive: Option<Directive> = None;
+    let mut allow_directive = true;
 
     stmts.retain(|stmt| {
         match stmt {
@@ -2309,9 +2359,8 @@ fn remove_server_directive_index_in_module(
                 ..
             })) => {
                 if value == "use server" {
-                    if is_directive {
-                        *in_action_file = true;
-                        *has_action = true;
+                    if allow_directive {
+                        directive = Some(Directive::UseServer);
                         return false;
                     } else {
                         emit_error(ServerActionsErrorKind::MisplacedDirective {
@@ -2323,7 +2372,7 @@ fn remove_server_directive_index_in_module(
                 } else
                 // `use cache` or `use cache: foo`
                 if value == "use cache" || value.starts_with("use cache: ") {
-                    if is_directive {
+                    if allow_directive {
                         if !config.dynamic_io_enabled {
                             emit_error(ServerActionsErrorKind::UseCacheWithoutDynamicIO {
                                 span: *span,
@@ -2332,22 +2381,23 @@ fn remove_server_directive_index_in_module(
                         }
 
                         if value == "use cache" {
-                            *file_cache_kind = Some("default".into());
+                            directive = Some(Directive::UseCache {
+                                cache_kind: RcStr::from("default"),
+                            })
                         } else {
                             // Slice the value after "use cache: "
-                            let cache_kind_str = RcStr::from(value.split_at("use cache: ".len()).1);
+                            let cache_kind = RcStr::from(value.split_at("use cache: ".len()).1);
 
-                            if !config.cache_kinds.contains(&cache_kind_str) {
+                            if !config.cache_kinds.contains(&cache_kind) {
                                 emit_error(ServerActionsErrorKind::UnknownCacheKind {
                                     span: *span,
-                                    cache_kind: cache_kind_str.clone(),
+                                    cache_kind: cache_kind.clone(),
                                 });
                             }
 
-                            *file_cache_kind = Some(cache_kind_str)
+                            directive = Some(Directive::UseCache { cache_kind })
                         }
 
-                        *has_cache = true;
                         return false;
                     } else {
                         emit_error(ServerActionsErrorKind::MisplacedDirective {
@@ -2378,7 +2428,7 @@ fn remove_server_directive_index_in_module(
             })) => {
                 // Match `("use server")`.
                 if value == "use server" || detect_similar_strings(value, "use server") {
-                    if is_directive {
+                    if allow_directive {
                         emit_error(ServerActionsErrorKind::WrappedDirective {
                             span: *span,
                             directive: "use server".to_string(),
@@ -2390,7 +2440,7 @@ fn remove_server_directive_index_in_module(
                         });
                     }
                 } else if value == "use cache" || detect_similar_strings(value, "use cache") {
-                    if is_directive {
+                    if allow_directive {
                         emit_error(ServerActionsErrorKind::WrappedDirective {
                             span: *span,
                             directive: "use cache".to_string(),
@@ -2404,11 +2454,13 @@ fn remove_server_directive_index_in_module(
                 }
             }
             _ => {
-                is_directive = false;
+                allow_directive = false;
             }
         }
         true
     });
+
+    directive
 }
 
 // Check if the function or arrow function has any action or cache directives,
@@ -2440,88 +2492,6 @@ fn has_body_directive(maybe_body: &Option<BlockStmt>) -> (bool, bool) {
     }
 
     (is_action_fn, is_cache_fn)
-}
-
-fn remove_server_directive_index_in_fn(
-    stmts: &mut Vec<Stmt>,
-    is_action_fn: &mut bool,
-    cache_kind: &mut Option<RcStr>,
-    action_span: &mut Option<Span>,
-    config: &Config,
-) {
-    let mut is_directive = true;
-
-    stmts.retain(|stmt| {
-        if let Stmt::Expr(ExprStmt {
-            expr: box Expr::Lit(Lit::Str(Str { value, span, .. })),
-            ..
-        }) = stmt
-        {
-            if value == "use server" {
-                *action_span = Some(*span);
-
-                if is_directive {
-                    *is_action_fn = true;
-                    return false;
-                } else {
-                    emit_error(ServerActionsErrorKind::MisplacedDirective {
-                        span: *span,
-                        directive: value.to_string(),
-                        location: DirectiveLocation::FunctionBody,
-                    });
-                }
-            } else if detect_similar_strings(value, "use server") {
-                // Detect typo of "use server"
-                emit_error(ServerActionsErrorKind::MisspelledDirective {
-                    span: *span,
-                    directive: value.to_string(),
-                    expected_directive: "use server".to_string(),
-                });
-            } else if value == "use cache" || value.starts_with("use cache: ") {
-                if is_directive {
-                    if !config.dynamic_io_enabled {
-                        emit_error(ServerActionsErrorKind::UseCacheWithoutDynamicIO {
-                            span: *span,
-                            directive: value.to_string(),
-                        });
-                    }
-
-                    if value == "use cache" {
-                        *cache_kind = Some("default".into());
-                    } else {
-                        // Slice the value after "use cache: "
-                        let cache_kind_str = RcStr::from(value.split_at("use cache: ".len()).1);
-
-                        if !config.cache_kinds.contains(&cache_kind_str) {
-                            emit_error(ServerActionsErrorKind::UnknownCacheKind {
-                                span: *span,
-                                cache_kind: cache_kind_str.clone(),
-                            });
-                        }
-
-                        *cache_kind = Some(cache_kind_str);
-                    };
-                    return false;
-                } else {
-                    emit_error(ServerActionsErrorKind::MisplacedDirective {
-                        span: *span,
-                        directive: value.to_string(),
-                        location: DirectiveLocation::FunctionBody,
-                    });
-                }
-            } else if detect_similar_strings(value, "use cache") {
-                // Detect typo of "use cache"
-                emit_error(ServerActionsErrorKind::MisspelledDirective {
-                    span: *span,
-                    directive: value.to_string(),
-                    expected_directive: "use cache".to_string(),
-                });
-            }
-        } else {
-            is_directive = false;
-        }
-        true
-    });
 }
 
 fn collect_idents_in_array_pat(elems: &[Option<Pat>], idents: &mut Vec<Ident>) {
@@ -2810,13 +2780,13 @@ fn emit_error(error_kind: ServerActionsErrorKind) {
                 "#
             },
         ),
-        ServerActionsErrorKind::InlineSyncFunction { span, is_action_fn } => (
+        ServerActionsErrorKind::InlineSyncFunction { span, directive } => (
             span,
             formatdoc! {
                 r#"
                     {subject} must be async functions.
                 "#,
-                subject = if is_action_fn {
+                subject = if let Directive::UseServer = directive {
                     "Server Actions"
                 } else {
                     "\"use cache\" functions"
@@ -2857,6 +2827,18 @@ fn emit_error(error_kind: ServerActionsErrorKind) {
                 r#"
                     Did you mean "{expected_directive}"? "{directive}" is not a supported directive name."
                 "#
+            },
+        ),
+        ServerActionsErrorKind::MultipleDirectives { span, location } => (
+            span,
+            formatdoc! {
+                r#"
+                    Conflicting directives "use server" and "use cache" found in the same {location}. You cannot place both directives at the top of a {location}. Please remove one of them.
+                "#,
+                location = match location {
+                    DirectiveLocation::Module => "file",
+                    DirectiveLocation::FunctionBody => "function body",
+                }
             },
         ),
         ServerActionsErrorKind::UnknownCacheKind { span, cache_kind } => (
