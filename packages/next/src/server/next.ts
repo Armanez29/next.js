@@ -350,7 +350,9 @@ class NextCustomServer implements NextWrapperServer {
       dir: this.options.dir!,
       port: this.options.port || 3000,
       isDev: !!this.options.dev,
-      onCleanup: this.cleanupListeners.add.bind(this.cleanupListeners),
+      onDevServerCleanup: this.options.dev
+        ? this.cleanupListeners.add.bind(this.cleanupListeners)
+        : undefined,
       hostname: this.options.hostname || 'localhost',
       minimalMode: this.options.minimalMode,
       quiet: this.options.quiet,
@@ -445,7 +447,7 @@ class NextCustomServer implements NextWrapperServer {
   }
 
   async close() {
-    await Promise.all([
+    await Promise.allSettled([
       this.init?.renderServer.close(),
       this.cleanupListeners.runAll(),
     ])
