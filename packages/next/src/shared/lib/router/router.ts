@@ -498,7 +498,12 @@ function fetchNextData({
       headers: Object.assign(
         {} as HeadersInit,
         isPrefetch ? { purpose: 'prefetch' } : {},
-        isPrefetch && hasMiddleware ? { 'x-middleware-prefetch': '1' } : {}
+        isPrefetch && hasMiddleware
+          ? {
+              'x-middleware-prefetch': '1',
+              'x-deployment-id': process.env.NEXT_DEPLOYMENT_ID,
+            }
+          : {}
       ),
       method: params?.method ?? 'GET',
     })
@@ -1922,8 +1927,9 @@ export default class Router implements BaseRouter {
 
     try {
       let props: Record<string, any> | undefined
-      const { page: Component, styleSheets } =
-        await this.fetchComponent('/_error')
+      const { page: Component, styleSheets } = await this.fetchComponent(
+        '/_error'
+      )
 
       const routeInfo: CompletePrivateRouteInfo = {
         props,
