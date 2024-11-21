@@ -808,7 +808,22 @@ export async function retry<T>(
   }
 }
 
-export async function assertHasRedbox(browser: BrowserInterface) {
+export interface AssertHasRedboxOptions {
+  /**
+   * Set to true, if any stackframe in the Redbox causes the middleware to return 500.
+   * This is always a bug that should be fixed.
+   */
+  fixmeStackFramesHaveBrokenSourcemaps?: boolean
+  /**
+   * Set to 500 if the page is expected to return a 500
+   * Can be an array representing each response recorded in this test.
+   */
+  pageResponseCode?: number | number[]
+}
+export async function assertHasRedbox(
+  browser: BrowserInterface,
+  options: AssertHasRedboxOptions = {}
+) {
   try {
     await retry(
       async () => {
@@ -830,6 +845,67 @@ export async function assertHasRedbox(browser: BrowserInterface) {
     )
   } catch (errorCause) {
     const error = new Error('Expected Redbox but found none')
+    Error.captureStackTrace(error, assertHasRedbox)
+    throw error
+  }
+
+  const logs = await browser.log()
+  const internalServerErrorLogs = logs.filter((log) => {
+    return (
+      log.source === 'error' &&
+      log.message.includes(
+        'Failed to load resource: the server responded with a status of 500 (Internal Server Error)'
+      )
+    )
+  })
+
+  if (
+    options.pageResponseCode === 500 &&
+    internalServerErrorLogs.length === 0
+  ) {
+    const error = new Error(
+      'Expected the page to return a 500 (Internal Server Error) but found no message indicating this error occured: ' +
+        logs
+    )
+    Error.captureStackTrace(error, assertHasRedbox)
+    throw error
+  }
+
+  const expectedInternalServerError =
+    options.pageResponseCode === 500
+      ? 1
+      : Array.isArray(options.pageResponseCode)
+        ? options.pageResponseCode.filter(
+            (responseCode) => responseCode === 500
+          ).length
+        : 0
+  const stackFramesWithBrokenSourceMaps =
+    internalServerErrorLogs.length - expectedInternalServerError
+  const stackFramesHaveBrokenSourcemapsActualExpected =
+    options.fixmeStackFramesHaveBrokenSourcemaps
+  if (
+    stackFramesWithBrokenSourceMaps > 0 &&
+    !stackFramesHaveBrokenSourcemapsActualExpected
+  ) {
+    // Ensures that tests are automatically updated when the bug is fixed.
+    const error = new Error(
+      `'Expected no broken sourcemaps but found ${stackFramesWithBrokenSourceMaps}. '` +
+        'Check the callstack to find the frames that are not sourcemapped. ' +
+        'Pass the `fixmeStackFramesHaveBrokenSourcemaps` option to silence this error. ' +
+        'Though keep in mind that this is a legit bug.'
+    )
+    Error.captureStackTrace(error, assertHasRedbox)
+    throw error
+  } else if (
+    stackFramesWithBrokenSourceMaps === 0 &&
+    stackFramesHaveBrokenSourcemapsActualExpected
+  ) {
+    // Ensures that tests are automatically updated when the bug is fixed.
+    const error = new Error(
+      'Expected broken sourcemaps but found none. ' +
+        'Seems like this bug was fixed. ' +
+        'You can safely remove the `fixmeStackFramesHaveBrokenSourcemaps` option.'
+    )
     Error.captureStackTrace(error, assertHasRedbox)
     throw error
   }
@@ -879,11 +955,15 @@ export async function hasErrorToast(
   })
 }
 
+export interface OpenRedboxOptions extends AssertHasRedboxOptions {}
 /**
  * Has retried version of {@link hasErrorToast} built-in.
  * Success implies {@link assertHasRedbox}.
  */
-export async function openRedbox(browser: BrowserInterface): Promise<void> {
+export async function openRedbox(
+  browser: BrowserInterface,
+  options: OpenRedboxOptions = {}
+): Promise<void> {
   try {
     browser.waitForElementByCss('[data-nextjs-toast]', 5000).click()
   } catch (cause) {
@@ -891,7 +971,7 @@ export async function openRedbox(browser: BrowserInterface): Promise<void> {
     Error.captureStackTrace(error, openRedbox)
     throw error
   }
-  await assertHasRedbox(browser)
+  await assertHasRedbox(browser, options)
 }
 
 export function getRedboxHeader(browser: BrowserInterface) {
