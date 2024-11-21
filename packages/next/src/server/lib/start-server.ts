@@ -32,6 +32,7 @@ import { validateTurboNextConfig } from '../../lib/turbopack-warning'
 import { type Span, trace, flushAllTraces } from '../../trace'
 import { isPostpone } from './router-utils/is-postpone'
 import { isIPv6 } from './is-ipv6'
+import { AsyncCallbackSet } from './async-callback-set'
 
 const debug = setupDebug('next:start-server')
 let startServerSpan: Span | undefined
@@ -53,7 +54,7 @@ export async function getRequestHandlers({
   dir,
   port,
   isDev,
-  onCleanup,
+  onDevServerCleanup,
   server,
   hostname,
   minimalMode,
@@ -64,7 +65,7 @@ export async function getRequestHandlers({
   dir: string
   port: number
   isDev: boolean
-  onCleanup: (listener: () => Promise<void>) => void
+  onDevServerCleanup: ((listener: () => Promise<void>) => void) | undefined
   server?: import('http').Server
   hostname?: string
   minimalMode?: boolean
@@ -76,7 +77,7 @@ export async function getRequestHandlers({
     dir,
     port,
     hostname,
-    onCleanup,
+    onDevServerCleanup,
     dev: isDev,
     minimalMode,
     server,
@@ -218,6 +219,11 @@ export async function startServer(
     }
   })
 
+  const cleanupListeners = new AsyncCallbackSet()
+  const onCleanup = cleanupListeners.add.bind(cleanupListeners)
+
+  onCleanup(() => new Promise<void>((res) => server.close(() => res())))
+
   await new Promise<void>((resolve) => {
     server.on('listening', async () => {
       const nodeDebugType = getNodeDebugType()
@@ -281,7 +287,6 @@ export async function startServer(
       Log.event(`Starting...`)
 
       try {
-        const cleanupListeners = [() => new Promise((res) => server.close(res))]
         let cleanupStarted = false
         const cleanup = () => {
           if (cleanupStarted) {
@@ -294,7 +299,7 @@ export async function startServer(
           cleanupStarted = true
           ;(async () => {
             debug('start-server process cleanup')
-            await Promise.all(cleanupListeners.map((f) => f()))
+            await cleanupListeners.runAll()
             debug('start-server process cleanup finished')
             process.exit(0)
           })()
@@ -327,7 +332,7 @@ export async function startServer(
           dir,
           port,
           isDev,
-          onCleanup: (listener) => cleanupListeners.push(listener),
+          onDevServerCleanup: isDev ? onCleanup : undefined,
           server,
           hostname,
           minimalMode,
@@ -336,6 +341,9 @@ export async function startServer(
         })
         requestHandler = initResult[0]
         upgradeHandler = initResult[1]
+        const nextServer = initResult[2]
+
+        onCleanup(() => nextServer.close())
 
         const startServerProcessDuration =
           performance.mark('next-start-end') &&

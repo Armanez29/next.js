@@ -81,6 +81,7 @@ async function initializeImpl(opts: {
   bundlerService: DevBundlerService | undefined
   startServerSpan: Span | undefined
   quiet?: boolean
+  onDevServerCleanup: ((listener: () => Promise<void>) => void) | undefined
 }) {
   const type = process.env.__NEXT_PRIVATE_RENDER_WORKER
   if (type) {
