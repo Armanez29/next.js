@@ -144,7 +144,14 @@ function getSourcemappedFrameIfPossible(
   let sourceMap: SyncSourceMapConsumer
   let sourceMapPayload: ModernSourceMapPayload
   if (sourceMapCacheEntry === undefined) {
-    const moduleSourceMap = findSourceMap(frame.file)
+    let sourceURL = frame.file
+    // e.g. "/APP/.next/server/chunks/ssr/[root of the server]__2934a0._.js"
+    // will be keyed by Node.js as "file:///APP/.next/server/chunks/ssr/[root%20of%20the%20server]__2934a0._.js".
+    // This is likely caused by `callsite.toString()` in `Error.prepareStackTrace converting file URLs to paths.
+    if (sourceURL.startsWith('/')) {
+      sourceURL = url.pathToFileURL(frame.file).toString()
+    }
+    const moduleSourceMap = findSourceMap(sourceURL)
     if (moduleSourceMap === undefined) {
       return null
     }
@@ -287,12 +294,12 @@ function parseAndSourceMap(error: Error): string {
   )
 }
 
-export function patchErrorInspect() {
-  Error.prepareStackTrace = prepareUnsourcemappedStackTrace
+export function patchErrorInspect(errorClass: ErrorConstructor): void {
+  errorClass.prepareStackTrace = prepareUnsourcemappedStackTrace
 
   // @ts-expect-error -- TODO upstream types
   // eslint-disable-next-line no-extend-native -- We're not extending but overriding.
-  Error.prototype[inspectSymbol] = function (
+  errorClass.prototype[inspectSymbol] = function (
     depth: number,
     inspectOptions: util.InspectOptions,
     inspect: typeof util.inspect
@@ -304,8 +311,8 @@ export function patchErrorInspect() {
       const newError =
         this.cause !== undefined
           ? // Setting an undefined `cause` would print `[cause]: undefined`
-            new Error(this.message, { cause: this.cause })
-          : new Error(this.message)
+            new errorClass(this.message, { cause: this.cause })
+          : new errorClass(this.message)
 
       // TODO: Ensure `class MyError extends Error {}` prints `MyError` as the name
       newError.stack = parseAndSourceMap(this)
