@@ -8470,6 +8470,7 @@ dependencies = [
  "tokio",
  "tokio-scoped",
  "tracing",
+ "turbo-persistence",
  "turbo-prehash",
  "turbo-rcstr",
  "turbo-tasks",
