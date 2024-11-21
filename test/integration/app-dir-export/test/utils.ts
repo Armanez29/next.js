@@ -176,6 +176,7 @@ export async function runTests({
       if (isDev) {
         const url = dynamicPage ? '/another/first' : '/api/json'
         const browser = await webdriver(port, url)
+        // TODO: Should succeed
         await assertHasRedbox(browser)
         const header = await getRedboxHeader(browser)
         const source = await getRedboxSource(browser)
