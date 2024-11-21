@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use turbo_rcstr::RcStr;
 use turbo_tasks::{ResolvedVc, Vc};
 use turbo_tasks_fs::glob::Glob;
@@ -8,13 +8,12 @@ use turbopack_core::{
     context::AssetContext,
     ident::AssetIdent,
     module::Module,
-    reference::{ModuleReference, ModuleReferences, SingleModuleReference},
+    reference::ModuleReferences,
     resolve::{origin::ResolveOrigin, ModulePart},
 };
 
 use super::{
-    chunk_item::EcmascriptModulePartChunkItem, get_part_id, part_of_module, split, split_module,
-    PartId, SplitResult,
+    chunk_item::EcmascriptModulePartChunkItem, part_of_module, split, split_module, SplitResult,
 };
 use crate::{
     chunk::{EcmascriptChunkPlaceable, EcmascriptExports},
@@ -23,7 +22,7 @@ use crate::{
         analyse_ecmascript_module, esm::FoundExportType, follow_reexports, FollowExportsResult,
     },
     side_effect_optimization::facade::module::EcmascriptModuleFacadeModule,
-    tree_shake::{side_effect_module::SideEffectsModule, Key},
+    tree_shake::side_effect_module::SideEffectsModule,
     AnalyzeEcmascriptModuleResult, EcmascriptAnalyzable, EcmascriptModuleAsset,
     EcmascriptModuleAssetType, EcmascriptModuleContent, EcmascriptParsable,
 };
@@ -120,8 +119,8 @@ impl EcmascriptModulePartAsset {
     pub async fn select_part(
         module: Vc<EcmascriptModuleAsset>,
         part: ResolvedVc<ModulePart>,
-    ) -> Result<Vc<Box<dyn Module>>> {
-        let SplitResult::Ok { entrypoints, .. } = &*split_module(module).await? else {
+    ) -> Result<Vc<Box<dyn EcmascriptChunkPlaceable>>> {
+        let SplitResult::Ok { .. } = &*split_module(module).await? else {
             return Ok(Vc::upcast(module));
         };
 
@@ -129,16 +128,10 @@ impl EcmascriptModulePartAsset {
         if let ModulePart::Export(export) = &*part.await? {
             let export_name = export.await?.clone_value();
 
-            // If a local binding or reexport with the same name exists, we stop here.
-            // Side effects of the barrel file are preserved.
-            if entrypoints.contains_key(&Key::Export(export_name.clone())) {
-                return Ok(Vc::upcast(EcmascriptModulePartAsset::new(module, *part)));
-            }
-
             let side_effect_free_packages = module.asset_context().side_effect_free_packages();
 
             // Exclude local bindings by using exports module part.
-            let source_module = Vc::upcast(module);
+            let source_module = Vc::upcast(EcmascriptModulePartAsset::new(module, *part));
 
             let FollowExportsWithSideEffectsResult {
                 side_effects,
@@ -262,62 +255,9 @@ impl Module for EcmascriptModulePartAsset {
 
     #[turbo_tasks::function]
     async fn references(&self) -> Result<Vc<ModuleReferences>> {
-        let split_data = split_module(*self.full_module).await?;
-
         let analyze = analyze(*self.full_module, *self.part).await?;
 
-        let deps = match &*split_data {
-            SplitResult::Ok { deps, .. } => deps,
-            SplitResult::Failed { .. } => return Ok(*analyze.references),
-        };
-
-        let part_dep = |part: Vc<ModulePart>| -> Vc<Box<dyn ModuleReference>> {
-            Vc::upcast(SingleModuleReference::new(
-                Vc::upcast(EcmascriptModulePartAsset::new(*self.full_module, part)),
-                Vc::cell("ecmascript module part".into()),
-            ))
-        };
-
-        let mut references = analyze.references.await?.to_vec();
-
-        // Facade depends on evaluation and re-exports
-        if matches!(&*self.part.await?, ModulePart::Facade) {
-            references.push(part_dep(ModulePart::evaluation()));
-            references.push(part_dep(ModulePart::exports()));
-            return Ok(Vc::cell(references));
-        }
-
-        let deps = {
-            let part_id = get_part_id(&split_data, *self.part)
-                .await
-                .with_context(|| format!("part {:?} is not found in the module", self.part))?;
-
-            match deps.get(&part_id) {
-                Some(v) => &**v,
-                None => &[],
-            }
-        };
-
-        references.extend(
-            deps.iter()
-                .filter_map(|part_id| {
-                    Some(part_dep(match part_id {
-                        // This is an internal part that is not for evaluation, so we don't need to
-                        // force-add it.
-                        PartId::Internal(.., false) => return None,
-                        PartId::Internal(part_id, true) => {
-                            ModulePart::internal_evaluation(*part_id)
-                        }
-                        PartId::Export(name) => ModulePart::export(name.clone()),
-                        _ => unreachable!(
-                            "PartId other than Internal and Export should not be used here"
-                        ),
-                    }))
-                })
-                .collect::<Vec<_>>(),
-        );
-
-        Ok(Vc::cell(references))
+        Ok(*analyze.references)
     }
 }
 

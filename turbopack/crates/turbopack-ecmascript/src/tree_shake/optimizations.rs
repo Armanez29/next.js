@@ -36,7 +36,7 @@ impl GraphOptimizer<'_> {
         (matches!(
             item_id,
             ItemId::Item {
-                kind: ItemIdItemKind::ImportBinding(..),
+                kind: ItemIdItemKind::ImportBinding(..) | ItemIdItemKind::ImportOfModule,
                 ..
             }
         )) || (matches!(item_id, ItemId::Group(ItemIdGroupKind::Export(..)))
