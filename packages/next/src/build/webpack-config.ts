@@ -2099,7 +2099,7 @@ export default async function getBaseWebpackConfig(
     modularizeImports: config.modularizeImports,
     imageLoaderFile: config.images.loaderFile,
     clientTraceMetadata: config.experimental.clientTraceMetadata,
-    serverSourceMaps: config.experimental.serverSourceMaps,
+    serverSourceMaps: config.serverSourceMaps,
     flyingShuttle: config.experimental.flyingShuttle,
     serverReferenceHashSalt: encryptionKey,
   })
@@ -2210,7 +2210,7 @@ export default async function getBaseWebpackConfig(
     experimental: config.experimental,
     disableStaticImages: config.images.disableStaticImages,
     transpilePackages: config.transpilePackages,
-    serverSourceMaps: config.experimental.serverSourceMaps,
+    serverSourceMaps: config.serverSourceMaps,
   })
 
   // @ts-ignore Cache exists
